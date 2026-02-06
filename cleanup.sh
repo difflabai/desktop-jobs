@@ -14,7 +14,16 @@ pkill -f 'node.*projects/song-creator-ats' 2>/dev/null && echo "  killed song-cr
 # nanobazaar-seller
 pkill -f 'node.*projects/nanobazaar-song-seller' 2>/dev/null && echo "  killed nanobazaar-seller" || echo "  nanobazaar-seller not running"
 
-# Clean up any stale ada state
-rm -rf ~/.ada/pids/*.pid 2>/dev/null || true
+# Kill any ada watch supervisor
+if [[ -f "${HOME}/.ada/watch.lock" ]]; then
+    pid=$(cat "${HOME}/.ada/watch.lock" 2>/dev/null || true)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null && echo "  killed ada supervisor (PID $pid)" || true
+    fi
+    rm -f "${HOME}/.ada/watch.lock"
+fi
 
-echo "Done. Ready for: ada start all"
+# Clean up stale ada state
+rm -f ~/.ada/pids/*.pid 2>/dev/null || true
+
+echo "Done. Ready for: ./ada start all"
