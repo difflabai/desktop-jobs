@@ -1,0 +1,23 @@
+[
+  {
+    "name": "ace-step",
+    "cmd": "source ~/env.vars && export HUGGINGFACE_TOKEN && python -m uvicorn acestep.api_server:app --host 0.0.0.0 --port 8000 --workers 1",
+    "dir": "/ml2/nanobot/ACE-Step-1.5",
+    "env_file": null,
+    "enabled": true
+  },
+  {
+    "name": "song-creator",
+    "cmd": "node index.js",
+    "dir": "~/projects/song-creator-ats",
+    "env_file": "~/env.vars",
+    "enabled": true
+  },
+  {
+    "name": "nanobazaar-seller",
+    "cmd": "node index.js",
+    "dir": "~/projects/nanobazaar-song-seller",
+    "env_file": "~/env.vars",
+    "enabled": true
+  }
+]
