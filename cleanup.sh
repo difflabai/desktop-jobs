@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Kill any existing instances of our managed services so we can transition to ada.
+# Kill any existing instances of managed services for a clean transition to ada.
 # Run once before starting ada for the first time.
 set -euo pipefail
 
@@ -24,6 +24,6 @@ if [[ -f "${HOME}/.ada/watch.lock" ]]; then
 fi
 
 # Clean up stale ada state
-rm -f ~/.ada/pids/*.pid 2>/dev/null || true
+rm -rf ~/.ada/pids/*.pid 2>/dev/null || true
 
 echo "Done. Ready for: ./ada start all"
