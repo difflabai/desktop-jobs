@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# ╔══════════════════════════════════════════════════════════════════════╗
-# ║  ada — dead-simple service manager for ~/projects/desktop-jobs      ║
-# ║  Dependencies: bash ≥4, jq, standard unix tools                     ║
-# ╚══════════════════════════════════════════════════════════════════════╝
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  ada — a dead-simple service manager for desktop jobs                      ║
+# ║  No dependencies beyond bash (4+), jq, and standard unix tools.            ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+#
+# Usage: ada <command> [args]
+# Run `ada help` for details.
+
 set -uo pipefail
+# NOTE: We intentionally do NOT use `set -e` because the supervisor loop and
+# many status checks must tolerate non-zero exits gracefully.
 
 readonly ADA_VERSION="1.0.0"
 
-# ── Paths ────────────────────────────────────────────────────────────────
+# ── Paths ─────────────────────────────────────────────────────────────────────
 readonly ADA_HOME="${HOME}/.ada"
 readonly ADA_PIDS="${ADA_HOME}/pids"
 readonly ADA_LOGS="${ADA_HOME}/logs"
@@ -16,62 +22,75 @@ readonly ADA_LOCK="${ADA_HOME}/watch.lock"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SERVICES_JSON="${SCRIPT_DIR}/services.json"
 
-# ── Tunables ─────────────────────────────────────────────────────────────
-readonly MAX_LOG_BYTES=$(( 2 * 1024 * 1024 ))   # 2 MB per service
-readonly CRASH_LOOP_THRESHOLD=5                   # max restarts in window
-readonly CRASH_LOOP_WINDOW=120                    # seconds
-readonly STOP_GRACE=5                             # seconds before SIGKILL
-readonly WATCH_INTERVAL=10                        # supervisor check interval
+readonly MAX_LOG_BYTES=$((2 * 1024 * 1024))   # 2 MB per service log
+readonly CRASH_LOOP_THRESHOLD=5                 # restarts within window
+readonly CRASH_LOOP_WINDOW=120                  # seconds
+readonly STOP_GRACE=5                           # seconds before SIGKILL
+readonly WATCH_INTERVAL=10                      # supervisor poll interval
 
-# ── Colors (disabled when stdout is not a tty) ──────────────────────────
+# ── Colors & Glyphs ──────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
-    readonly RST=$'\033[0m'  BOLD=$'\033[1m'  DIM=$'\033[2m'
-    readonly RED=$'\033[31m' GREEN=$'\033[32m' YELLOW=$'\033[33m' CYAN=$'\033[36m'
-    readonly BG_RED=$'\033[41m' WHITE=$'\033[97m'
+    readonly RST=$'\033[0m'
+    readonly BOLD=$'\033[1m'
+    readonly DIM=$'\033[2m'
+    readonly RED=$'\033[31m'
+    readonly GREEN=$'\033[32m'
+    readonly YELLOW=$'\033[33m'
+    readonly BLUE=$'\033[34m'
+    readonly CYAN=$'\033[36m'
+    readonly WHITE=$'\033[37m'
+    readonly BG_RED=$'\033[41m'
+    readonly BG_GREEN=$'\033[42m'
 else
-    readonly RST="" BOLD="" DIM="" RED="" GREEN="" YELLOW="" CYAN="" BG_RED="" WHITE=""
+    readonly RST='' BOLD='' DIM='' RED='' GREEN='' YELLOW='' BLUE='' CYAN='' WHITE='' BG_RED='' BG_GREEN=''
 fi
 
-# ── Bootstrap ────────────────────────────────────────────────────────────
+# ── Init directories ─────────────────────────────────────────────────────────
 mkdir -p "${ADA_PIDS}" "${ADA_LOGS}" "${ADA_STATE}"
 
-# ── Helpers ──────────────────────────────────────────────────────────────
-die()  { printf '%b\n' "${RED}error:${RST} $*" >&2; exit 1; }
+# ── Helpers ───────────────────────────────────────────────────────────────────
+die()  { printf '%b\n' "${RED}${BOLD}error:${RST} $*" >&2; exit 1; }
 info() { printf '%b\n' "${CYAN}▸${RST} $*"; }
 warn() { printf '%b\n' "${YELLOW}▸${RST} $*"; }
+ok()   { printf '%b\n' "${GREEN}✓${RST} $*"; }
 
 expand_tilde() { printf '%s' "${1/#\~/$HOME}"; }
 
-# ── Config readers ───────────────────────────────────────────────────────
+# ── JSON helpers ──────────────────────────────────────────────────────────────
 require_config() {
     [[ -f "${SERVICES_JSON}" ]] || die "config not found: ${SERVICES_JSON}"
+    jq empty "${SERVICES_JSON}" 2>/dev/null || die "invalid JSON in ${SERVICES_JSON}"
 }
 
 service_names() {
-    require_config
-    jq -r '.[].name' "${SERVICES_JSON}"
+    jq -r '.[].name' "${SERVICES_JSON}" 2>/dev/null
 }
 
 enabled_names() {
-    require_config
-    jq -r '.[] | select(.enabled == true) | .name' "${SERVICES_JSON}"
+    jq -r '.[] | select(.enabled == true) | .name' "${SERVICES_JSON}" 2>/dev/null
 }
 
 service_exists() {
-    require_config
     jq -e --arg n "$1" '.[] | select(.name == $n)' "${SERVICES_JSON}" >/dev/null 2>&1
 }
 
 service_field() {
     jq -r --arg n "$1" --arg f "$2" \
-        '.[] | select(.name == $n) | .[$f] // empty' "${SERVICES_JSON}"
+        '.[] | select(.name == $n) | .[$f] // empty' "${SERVICES_JSON}" 2>/dev/null
 }
 
-require_service() {
-    service_exists "$1" || die "unknown service: $1"
+# Atomic write to services.json (write to temp, then mv)
+write_services() {
+    local tmp="${SERVICES_JSON}.tmp.$$"
+    if printf '%s\n' "$1" | jq '.' > "${tmp}" 2>/dev/null; then
+        mv -f "${tmp}" "${SERVICES_JSON}"
+    else
+        rm -f "${tmp}"
+        die "failed to write services.json — JSON was invalid"
+    fi
 }
 
-# ── PID / file helpers ──────────────────────────────────────────────────
+# ── PID / process helpers ────────────────────────────────────────────────────
 pid_file()   { printf '%s' "${ADA_PIDS}/${1}.pid"; }
 log_file()   { printf '%s' "${ADA_LOGS}/${1}.log"; }
 state_file() { printf '%s' "${ADA_STATE}/${1}.json"; }
@@ -79,7 +98,7 @@ state_file() { printf '%s' "${ADA_STATE}/${1}.json"; }
 read_pid() {
     local pf
     pf="$(pid_file "$1")"
-    [[ -f "${pf}" ]] && cat "${pf}" || printf ''
+    [[ -f "${pf}" ]] && cat "${pf}" 2>/dev/null || printf ''
 }
 
 is_running() {
@@ -88,7 +107,7 @@ is_running() {
     [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null
 }
 
-# ── Log rotation ─────────────────────────────────────────────────────────
+# ── Log rotation ─────────────────────────────────────────────────────────────
 rotate_log() {
     local lf
     lf="$(log_file "$1")"
@@ -96,16 +115,21 @@ rotate_log() {
     local sz
     sz=$(stat -c%s "${lf}" 2>/dev/null || stat -f%z "${lf}" 2>/dev/null || echo 0)
     if (( sz > MAX_LOG_BYTES )); then
-        tail -c "${MAX_LOG_BYTES}" "${lf}" > "${lf}.tmp" && mv "${lf}.tmp" "${lf}"
+        local keep=$(( MAX_LOG_BYTES * 3 / 4 ))
+        tail -c "${keep}" "${lf}" > "${lf}.rotate.$$" 2>/dev/null && \
+            mv -f "${lf}.rotate.$$" "${lf}" || \
+            rm -f "${lf}.rotate.$$"
     fi
 }
 
-# ── State management ────────────────────────────────────────────────────
+# ── State management ─────────────────────────────────────────────────────────
 init_state() {
     local sf
     sf="$(state_file "$1")"
     [[ -f "${sf}" ]] && return 0
-    printf '%s\n' '{"restart_count":0,"restart_times":[],"crash_loop":false,"started_at":null}' > "${sf}"
+    cat > "${sf}" <<'STATEEOF'
+{"restart_count":0,"restart_times":[],"crash_loop":false,"started_at":null}
+STATEEOF
 }
 
 get_state() {
@@ -114,22 +138,32 @@ get_state() {
 }
 
 set_state() {
-    printf '%s\n' "$2" > "$(state_file "$1")"
+    local sf
+    sf="$(state_file "$1")"
+    local tmp="${sf}.tmp.$$"
+    if printf '%s\n' "$2" | jq '.' > "${tmp}" 2>/dev/null; then
+        mv -f "${tmp}" "${sf}"
+    else
+        rm -f "${tmp}"
+    fi
 }
 
 record_restart() {
-    local name="$1" now cutoff state recent
+    local name="$1"
+    local now
     now=$(date +%s)
-    cutoff=$(( now - CRASH_LOOP_WINDOW ))
+    local state cutoff
     state="$(get_state "${name}")"
+    cutoff=$(( now - CRASH_LOOP_WINDOW ))
 
-    state=$(printf '%s' "${state}" | jq \
-        --argjson now "${now}" --argjson cutoff "${cutoff}" '
-        .restart_times = ([.restart_times[] | select(. > $cutoff)] + [$now])
-        | .restart_count += 1
+    state=$(printf '%s' "${state}" | jq --argjson now "${now}" --argjson cutoff "${cutoff}" '
+        .restart_times = ([.restart_times[] | select(. > $cutoff)] + [$now]) |
+        .restart_count = (.restart_count + 1)
     ')
 
+    local recent
     recent=$(printf '%s' "${state}" | jq '[.restart_times[]] | length')
+
     if (( recent > CRASH_LOOP_THRESHOLD )); then
         state=$(printf '%s' "${state}" | jq '.crash_loop = true')
     fi
@@ -157,8 +191,9 @@ get_started_at() {
 }
 
 set_started_at() {
-    local now state
+    local now
     now=$(date +%s)
+    local state
     state="$(get_state "$1")"
     state=$(printf '%s' "${state}" | jq --argjson t "${now}" '.started_at = $t')
     set_state "$1" "${state}"
@@ -171,106 +206,68 @@ clear_started_at() {
     set_state "$1" "${state}"
 }
 
-# ── Resolve "all" → list of names ───────────────────────────────────────
-resolve_targets() {
-    if [[ "$1" == "all" ]]; then
-        service_names
-    else
-        printf '%s\n' "$1"
-    fi
-}
-
-resolve_enabled_targets() {
-    if [[ "$1" == "all" ]]; then
-        enabled_names
-    else
-        printf '%s\n' "$1"
-    fi
-}
-
-# ── Display helpers ──────────────────────────────────────────────────────
-last_log_line() {
-    local lf
-    lf="$(log_file "$1")"
-    [[ -f "${lf}" ]] || return 0
-    # Strip ANSI escapes for clean display
-    tail -1 "${lf}" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-80
-}
-
-human_uptime() {
-    local s="$1"
-    if   (( s < 60 ));    then printf '%ds' "${s}"
-    elif (( s < 3600 ));  then printf '%dm %ds'  $(( s/60 )) $(( s%60 ))
-    elif (( s < 86400 )); then printf '%dh %dm'  $(( s/3600 )) $(( (s%3600)/60 ))
-    else                       printf '%dd %dh'  $(( s/86400 )) $(( (s%86400)/3600 ))
-    fi
-}
-
-repeat_char() {
-    local i
-    for (( i=0; i<$2; i++ )); do printf '%s' "$1"; done
-}
-
-# ═══════════════════════════════════════════════════════════════════════
-#  COMMANDS
-# ═══════════════════════════════════════════════════════════════════════
-
-# ── start ────────────────────────────────────────────────────────────────
-cmd_start() {
+# ── Core: start ──────────────────────────────────────────────────────────────
+do_start() {
     local name="$1"
-    require_service "${name}"
+    service_exists "${name}" || die "unknown service: ${name}"
 
     if is_running "${name}"; then
-        info "${name} already running (PID $(read_pid "${name}"))"
+        info "${name} already running ${DIM}(PID $(read_pid "${name}"))${RST}"
         return 0
     fi
 
-    local cmd dir env_file lf full_cmd
+    local cmd dir env_file
     cmd="$(service_field "${name}" cmd)"
     dir="$(expand_tilde "$(service_field "${name}" dir)")"
     env_file="$(service_field "${name}" env_file)"
+
+    [[ -d "${dir}" ]] || die "working directory does not exist: ${dir}"
+
+    local lf
     lf="$(log_file "${name}")"
-
-    [[ -d "${dir}" ]] || die "directory does not exist: ${dir}"
-
     rotate_log "${name}"
 
-    # Build launch command with optional env_file
-    full_cmd=""
+    # Build full command with optional env_file sourcing
+    local full_cmd=""
     if [[ -n "${env_file}" ]]; then
         env_file="$(expand_tilde "${env_file}")"
         if [[ -f "${env_file}" ]]; then
-            full_cmd="set -a; source $(printf '%q' "${env_file}"); set +a; "
+            full_cmd="set -a; source '${env_file}'; set +a; "
         else
             warn "env_file not found: ${env_file} — starting without it"
         fi
     fi
     full_cmd+="${cmd}"
 
-    # Launch in its own session so SIGTERM propagates to child processes.
-    # setsid detaches from our terminal; the process won't die when ada exits.
-    setsid bash -c "cd $(printf '%q' "${dir}") && exec bash -c $(printf '%q' "${full_cmd}")" \
-        >>"${lf}" 2>&1 &
-    local pid=$!
+    # Timestamp the start in the log
+    printf '\n[%s] === ada starting %s ===\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${name}" >> "${lf}"
 
-    # Brief grace period to detect immediate crashes
-    sleep 0.4
+    # Launch in a new session so it survives terminal close.
+    # setsid gives the child its own process group for clean stop.
+    setsid bash -c "cd $(printf '%q' "${dir}") && exec bash -c $(printf '%q' "${full_cmd}")" \
+        >> "${lf}" 2>&1 &
+    local pid=$!
+    disown "${pid}" 2>/dev/null || true
+
+    printf '%s' "${pid}" > "$(pid_file "${name}")"
+    set_started_at "${name}"
+
+    # Give it a moment to fail fast
+    sleep 0.5
     if kill -0 "${pid}" 2>/dev/null; then
-        printf '%d' "${pid}" > "$(pid_file "${name}")"
-        set_started_at "${name}"
-        info "${name} started (PID ${pid})"
+        ok "${name} started ${DIM}(PID ${pid})${RST}"
     else
-        warn "${name} exited immediately — check: ada logs ${name}"
+        warn "${name} exited immediately — check: ${BOLD}ada logs ${name}${RST}"
         rm -f "$(pid_file "${name}")"
         clear_started_at "${name}"
         return 1
     fi
 }
 
-# ── stop ─────────────────────────────────────────────────────────────────
-cmd_stop() {
+# ── Core: stop ───────────────────────────────────────────────────────────────
+do_stop() {
     local name="$1"
-    require_service "${name}"
+    service_exists "${name}" || die "unknown service: ${name}"
 
     local pid
     pid="$(read_pid "${name}")"
@@ -282,11 +279,20 @@ cmd_stop() {
         return 0
     fi
 
-    info "stopping ${name} (PID ${pid})…"
+    info "stopping ${name} ${DIM}(PID ${pid})${RST}..."
 
-    # Try SIGTERM to the process group first, fall back to just the PID
-    kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
+    # Try to kill the whole process group (catches child processes)
+    local pgid
+    pgid=$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ')
 
+    # Graceful SIGTERM
+    if [[ -n "${pgid}" ]] && [[ "${pgid}" != "0" ]] && [[ "${pgid}" != "1" ]]; then
+        kill -TERM -"${pgid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
+    else
+        kill -TERM "${pid}" 2>/dev/null || true
+    fi
+
+    # Wait for graceful shutdown
     local waited=0
     while (( waited < STOP_GRACE )); do
         kill -0 "${pid}" 2>/dev/null || break
@@ -294,240 +300,318 @@ cmd_stop() {
         (( waited++ )) || true
     done
 
+    # Escalate to SIGKILL if still alive
     if kill -0 "${pid}" 2>/dev/null; then
         warn "PID ${pid} did not exit — sending SIGKILL"
-        kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+        if [[ -n "${pgid}" ]] && [[ "${pgid}" != "0" ]] && [[ "${pgid}" != "1" ]]; then
+            kill -KILL -"${pgid}" 2>/dev/null || true
+        fi
+        kill -KILL "${pid}" 2>/dev/null || true
         sleep 0.5
     fi
 
+    # Log the stop
+    local lf
+    lf="$(log_file "${name}")"
+    printf '[%s] === ada stopped %s ===\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${name}" >> "${lf}" 2>/dev/null
+
     rm -f "$(pid_file "${name}")"
     clear_started_at "${name}"
-    info "${name} stopped"
+    ok "${name} stopped"
 }
 
-# ── restart ──────────────────────────────────────────────────────────────
-cmd_restart() {
+# ── Core: restart ────────────────────────────────────────────────────────────
+do_restart() {
     local name="$1"
-    require_service "${name}"
+    service_exists "${name}" || die "unknown service: ${name}"
     clear_crash_loop "${name}"
-    cmd_stop "${name}"
-    cmd_start "${name}"
+    do_stop "${name}"
+    do_start "${name}"
 }
 
-# ── status ───────────────────────────────────────────────────────────────
-cmd_status() {
+# ── Status ────────────────────────────────────────────────────────────────────
+human_duration() {
+    local secs="$1"
+    if (( secs < 0 )); then
+        printf '-'
+    elif (( secs < 60 )); then
+        printf '%ds' "${secs}"
+    elif (( secs < 3600 )); then
+        printf '%dm %ds' $(( secs / 60 )) $(( secs % 60 ))
+    elif (( secs < 86400 )); then
+        printf '%dh %dm' $(( secs / 3600 )) $(( (secs % 3600) / 60 ))
+    else
+        printf '%dd %dh' $(( secs / 86400 )) $(( (secs % 86400) / 3600 ))
+    fi
+}
+
+last_log_line() {
+    local lf
+    lf="$(log_file "$1")"
+    [[ -f "${lf}" ]] || return 0
+    # Skip ada's own markers and blank lines to get actual service output
+    local line
+    line=$(tail -20 "${lf}" 2>/dev/null | grep -v '=== ada ' | grep -v '^$' | tail -1 | head -c 60)
+    printf '%s' "${line}"
+}
+
+do_status() {
     require_config
     local now
     now=$(date +%s)
 
-    # Column widths
-    local wN=20 wP=7 wS=12 wU=10 wR=8 wL=42
-
-    # Horizontal rules for each column
-    local rN rP rS rU rR rL
-    rN="$(repeat_char '─' $(( wN + 2 )))"
-    rP="$(repeat_char '─' $(( wP + 2 )))"
-    rS="$(repeat_char '─' $(( wS + 2 )))"
-    rU="$(repeat_char '─' $(( wU + 2 )))"
-    rR="$(repeat_char '─' $(( wR + 2 )))"
-    rL="$(repeat_char '─' $(( wL + 2 )))"
-
-    printf '\n'
-    # ┌ top border
-    printf '  ┌%s┬%s┬%s┬%s┬%s┬%s┐\n' "${rN}" "${rP}" "${rS}" "${rU}" "${rR}" "${rL}"
-
-    # Header
-    printf "  │ ${BOLD}%-${wN}s${RST} │ ${BOLD}%-${wP}s${RST} │ ${BOLD}%-${wS}s${RST} │ ${BOLD}%-${wU}s${RST} │ ${BOLD}%-${wR}s${RST} │ ${BOLD}%-${wL}s${RST} │\n" \
-        "SERVICE" "PID" "STATE" "UPTIME" "RESTARTS" "LAST LOG"
-
-    # ├ separator
-    printf '  ├%s┼%s┼%s┼%s┼%s┼%s┤\n' "${rN}" "${rP}" "${rS}" "${rU}" "${rR}" "${rL}"
-
     local names
-    names="$(service_names 2>/dev/null)"
+    names="$(service_names)"
+
     if [[ -z "${names}" ]]; then
-        local total_w=$(( wN + wP + wS + wU + wR + wL + 12 ))
-        printf "  │ ${DIM}%-${total_w}s${RST}│\n" "(no services configured)"
-        printf '  └%s┴%s┴%s┴%s┴%s┴%s┘\n' "${rN}" "${rP}" "${rS}" "${rU}" "${rR}" "${rL}"
-        printf '\n'
+        printf '\n  %bno services configured%b\n\n' "${DIM}" "${RST}"
         return
     fi
 
+    local total=0 running=0 stopped=0 crashed=0
+
+    printf '\n'
+    printf '  %b%-18s  %-7s  %-12s  %-10s  %-4s  %s%b\n' \
+        "${BOLD}" "SERVICE" "PID" "STATE" "UPTIME" "↻" "LAST OUTPUT" "${RST}"
+    printf '  %b%.18s  %.7s  %.12s  %.10s  %.4s  %.40s%b\n' \
+        "${DIM}" \
+        "──────────────────" "───────" "────────────" "──────────" "────" \
+        "────────────────────────────────────────" "${RST}"
+
     while IFS= read -r name; do
-        local pid state sc uptime_str restarts last enabled rc=""
+        [[ -z "${name}" ]] && continue
+        (( total++ )) || true
+
+        local pid state state_color uptime_str restarts last_line enabled line_color
 
         enabled="$(service_field "${name}" enabled)"
         pid="$(read_pid "${name}")"
         restarts="$(get_restart_count "${name}")"
-        last="$(last_log_line "${name}")"
-        [[ ${#last} -gt ${wL} ]] && last="${last:0:$(( wL - 1 ))}…"
+        last_line="$(last_log_line "${name}")"
+
+        if (( ${#last_line} > 40 )); then
+            last_line="${last_line:0:37}..."
+        fi
+
+        line_color=""
 
         if is_crash_loop "${name}"; then
             state="CRASH-LOOP"
-            sc="${BG_RED}${WHITE}${BOLD}"
-            rc="${RED}"
+            state_color="${BG_RED}${WHITE}${BOLD}"
+            line_color="${RED}"
             pid="-"
             uptime_str="-"
+            (( crashed++ )) || true
         elif [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-            state="running"
-            sc="${GREEN}"
-            local sa
-            sa="$(get_started_at "${name}")"
-            if [[ -n "${sa}" && "${sa}" != "null" ]]; then
-                uptime_str="$(human_uptime $(( now - sa )))"
+            state="● running"
+            state_color="${GREEN}"
+            (( running++ )) || true
+            local started_at
+            started_at="$(get_started_at "${name}")"
+            if [[ -n "${started_at}" ]] && [[ "${started_at}" != "null" ]]; then
+                uptime_str="$(human_duration $(( now - started_at )))"
             else
                 uptime_str="?"
             fi
         else
             pid="-"
-            if [[ "${enabled}" == "true" ]]; then
-                state="stopped"
-                sc="${YELLOW}"
-            else
-                state="disabled"
-                sc="${DIM}"
-            fi
             uptime_str="-"
             rm -f "$(pid_file "${name}")" 2>/dev/null
+            if [[ "${enabled}" == "true" ]]; then
+                state="○ stopped"
+                state_color="${YELLOW}"
+                (( stopped++ )) || true
+            else
+                state="○ disabled"
+                state_color="${DIM}"
+                (( stopped++ )) || true
+            fi
         fi
 
-        printf "  │ ${rc}%-${wN}s${RST} │ ${rc}%-${wP}s${RST} │ ${sc}%-${wS}s${RST} │ ${rc}%-${wU}s${RST} │ ${rc}%-${wR}s${RST} │ ${DIM}%-${wL}s${RST} │\n" \
-            "${name}" "${pid}" "${state}" "${uptime_str}" "${restarts}" "${last}"
+        local restart_color=""
+        if (( restarts > CRASH_LOOP_THRESHOLD )); then
+            restart_color="${RED}"
+        elif (( restarts > 0 )); then
+            restart_color="${YELLOW}"
+        fi
+
+        printf '  %b%-18s%b  %b%-7s%b  %b%-12s%b  %-10s  %b%-4s%b  %b%s%b\n' \
+            "${line_color}" "${name}" "${RST}" \
+            "${DIM}" "${pid}" "${RST}" \
+            "${state_color}" "${state}" "${RST}" \
+            "${uptime_str}" \
+            "${restart_color}" "${restarts}" "${RST}" \
+            "${DIM}" "${last_line}" "${RST}"
+
     done <<< "${names}"
 
-    # └ bottom border
-    printf '  └%s┴%s┴%s┴%s┴%s┴%s┘\n' "${rN}" "${rP}" "${rS}" "${rU}" "${rR}" "${rL}"
-    printf '\n'
+    printf '\n  '
+    if (( running > 0 )); then
+        printf '%b%d running%b' "${GREEN}" "${running}" "${RST}"
+    fi
+    if (( stopped > 0 )); then
+        (( running > 0 )) && printf '  '
+        printf '%b%d stopped%b' "${YELLOW}" "${stopped}" "${RST}"
+    fi
+    if (( crashed > 0 )); then
+        printf '  %b%d crash-looped%b' "${RED}" "${crashed}" "${RST}"
+    fi
+    printf '  %b(%d total)%b\n' "${DIM}" "${total}" "${RST}"
 
-    # Supervisor indicator
     if [[ -f "${ADA_LOCK}" ]]; then
-        local wpid
-        wpid="$(cat "${ADA_LOCK}" 2>/dev/null)"
-        if [[ -n "${wpid}" ]] && kill -0 "${wpid}" 2>/dev/null; then
-            printf '  %b◉%b %bsupervisor active (PID %s)%b\n' "${GREEN}" "${RST}" "${DIM}" "${wpid}" "${RST}"
+        local watch_pid
+        watch_pid="$(cat "${ADA_LOCK}" 2>/dev/null)"
+        if [[ -n "${watch_pid}" ]] && kill -0 "${watch_pid}" 2>/dev/null; then
+            printf '  %b◉ supervisor active%b %b(PID %s)%b\n' \
+                "${GREEN}" "${RST}" "${DIM}" "${watch_pid}" "${RST}"
         else
-            printf '  %b◌%b %bsupervisor not running (stale lock)%b\n' "${YELLOW}" "${RST}" "${DIM}" "${RST}"
+            printf '  %b◌ supervisor not running%b %b(stale lock)%b\n' \
+                "${YELLOW}" "${RST}" "${DIM}" "${RST}"
             rm -f "${ADA_LOCK}"
         fi
     else
-        printf '  %b◌%b %bsupervisor not running%b\n' "${YELLOW}" "${RST}" "${DIM}" "${RST}"
+        printf '  %b◌ supervisor not running%b\n' "${DIM}" "${RST}"
     fi
     printf '\n'
 }
 
-# ── logs ─────────────────────────────────────────────────────────────────
-cmd_logs() {
-    local name="$1"; shift
-    require_service "${name}"
+# ── Logs ──────────────────────────────────────────────────────────────────────
+do_logs() {
+    local name="$1"
+    shift
+    service_exists "${name}" || die "unknown service: ${name}"
 
     local lf
     lf="$(log_file "${name}")"
-    [[ -f "${lf}" ]] || die "no log file yet for ${name}"
 
-    local lines="" follow=true
+    [[ -f "${lf}" ]] || die "no log file for ${name} yet — has it been started?"
+
+    local lines=""
+    local follow=true
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -n)  lines="${2:?'-n' requires a number}"; follow=false; shift 2 ;;
-            -f)  follow=true; shift ;;
-            *)   die "unknown flag: $1" ;;
+            -n)
+                [[ $# -ge 2 ]] || die "-n requires a number"
+                lines="$2"
+                follow=false
+                shift 2
+                ;;
+            -f)     follow=true;  shift ;;
+            --tail) follow=false; shift ;;
+            *)      die "unknown option: $1 (try: ada logs <name> [-n N] [-f])" ;;
         esac
     done
 
     if [[ -n "${lines}" ]]; then
         tail -n "${lines}" "${lf}"
     elif ${follow}; then
-        printf '%b── %s ── ctrl-c to exit ──%b\n' "${DIM}" "${name}" "${RST}"
+        info "tailing ${name} logs... ${DIM}(Ctrl+C to stop)${RST}"
         tail -f "${lf}"
     else
         tail -n 50 "${lf}"
     fi
 }
 
-# ── add ──────────────────────────────────────────────────────────────────
-cmd_add() {
+# ── Add / Remove ──────────────────────────────────────────────────────────────
+do_add() {
     local name="$1" cmd="$2" dir="$3"
     local env_file="${4:-}"
 
     require_config
-    if service_exists "${name}"; then
-        die "service '${name}' already exists"
-    fi
+    service_exists "${name}" && die "service '${name}' already exists"
 
-    local entry
+    [[ "${name}" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || \
+        die "invalid service name: '${name}' (use alphanumeric, hyphens, dots, underscores)"
+
+    local new_entry
     if [[ -n "${env_file}" ]]; then
-        entry=$(jq -n \
+        new_entry=$(jq -n \
             --arg n "${name}" --arg c "${cmd}" --arg d "${dir}" --arg e "${env_file}" \
             '{name:$n, cmd:$c, dir:$d, env_file:$e, enabled:true}')
     else
-        entry=$(jq -n \
+        new_entry=$(jq -n \
             --arg n "${name}" --arg c "${cmd}" --arg d "${dir}" \
             '{name:$n, cmd:$c, dir:$d, env_file:null, enabled:true}')
     fi
 
-    # Atomic write via temp file
-    jq --argjson e "${entry}" '. + [$e]' "${SERVICES_JSON}" > "${SERVICES_JSON}.tmp" \
-        && mv "${SERVICES_JSON}.tmp" "${SERVICES_JSON}"
+    local updated
+    updated=$(jq --argjson entry "${new_entry}" '. + [$entry]' "${SERVICES_JSON}")
+    write_services "${updated}"
 
-    info "added service: ${name}"
+    ok "added service: ${name}"
 }
 
-# ── remove ───────────────────────────────────────────────────────────────
-cmd_remove() {
+do_remove() {
     local name="$1"
-    require_service "${name}"
+    require_config
+    service_exists "${name}" || die "unknown service: ${name}"
 
     if is_running "${name}"; then
-        info "stopping ${name} first…"
-        cmd_stop "${name}"
+        info "stopping ${name} first..."
+        do_stop "${name}"
     fi
 
-    jq --arg n "${name}" '[.[] | select(.name != $n)]' "${SERVICES_JSON}" \
-        > "${SERVICES_JSON}.tmp" && mv "${SERVICES_JSON}.tmp" "${SERVICES_JSON}"
+    local updated
+    updated=$(jq --arg n "${name}" '[.[] | select(.name != $n)]' "${SERVICES_JSON}")
+    write_services "${updated}"
 
     rm -f "$(pid_file "${name}")" "$(state_file "${name}")"
-    info "removed service: ${name}"
+    ok "removed service: ${name}"
 }
 
-# ── enable / disable ────────────────────────────────────────────────────
-cmd_enable() {
+# ── Enable / Disable ─────────────────────────────────────────────────────────
+do_enable() {
     local name="$1"
-    require_service "${name}"
-    jq --arg n "${name}" \
-        '[.[] | if .name == $n then .enabled = true else . end]' "${SERVICES_JSON}" \
-        > "${SERVICES_JSON}.tmp" && mv "${SERVICES_JSON}.tmp" "${SERVICES_JSON}"
-    info "enabled: ${name}"
+    require_config
+    service_exists "${name}" || die "unknown service: ${name}"
+    local updated
+    updated=$(jq --arg n "${name}" \
+        '[.[] | if .name == $n then .enabled = true else . end]' "${SERVICES_JSON}")
+    write_services "${updated}"
+    ok "enabled: ${name}"
 }
 
-cmd_disable() {
+do_disable() {
     local name="$1"
-    require_service "${name}"
-    jq --arg n "${name}" \
-        '[.[] | if .name == $n then .enabled = false else . end]' "${SERVICES_JSON}" \
-        > "${SERVICES_JSON}.tmp" && mv "${SERVICES_JSON}.tmp" "${SERVICES_JSON}"
-    info "disabled: ${name}"
+    require_config
+    service_exists "${name}" || die "unknown service: ${name}"
+
+    if is_running "${name}"; then
+        info "stopping ${name} first..."
+        do_stop "${name}"
+    fi
+
+    local updated
+    updated=$(jq --arg n "${name}" \
+        '[.[] | if .name == $n then .enabled = false else . end]' "${SERVICES_JSON}")
+    write_services "${updated}"
+    ok "disabled: ${name}"
 }
 
-# ── watch (supervisor) ──────────────────────────────────────────────────
-cmd_watch() {
-    # Prevent double supervisors via lock file
+# ── Watch (supervisor) ────────────────────────────────────────────────────────
+watch_log() {
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "${ADA_LOGS}/supervisor.log"
+}
+
+do_watch() {
+    # Prevent double supervisors
     if [[ -f "${ADA_LOCK}" ]]; then
-        local existing
-        existing="$(cat "${ADA_LOCK}" 2>/dev/null)"
-        if [[ -n "${existing}" ]] && kill -0 "${existing}" 2>/dev/null; then
-            die "supervisor already running (PID ${existing}). Kill it or remove ${ADA_LOCK}"
+        local existing_pid
+        existing_pid="$(cat "${ADA_LOCK}" 2>/dev/null)"
+        if [[ -n "${existing_pid}" ]] && kill -0 "${existing_pid}" 2>/dev/null; then
+            die "supervisor already running (PID ${existing_pid}). Kill it or remove ${ADA_LOCK}"
         fi
         rm -f "${ADA_LOCK}"
     fi
 
-    printf '%d' $$ > "${ADA_LOCK}"
-    trap 'rm -f "${ADA_LOCK}"; exit 0' INT TERM EXIT
+    printf '%s' $$ > "${ADA_LOCK}"
 
-    local watch_log="${ADA_LOGS}/watch.log"
-    local ts
-    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    trap 'rm -f "${ADA_LOCK}"; watch_log "supervisor stopped (PID $$)"; exit 0' INT TERM
+    trap 'rm -f "${ADA_LOCK}"' EXIT
 
-    info "supervisor started (PID $$)"
-    printf '[%s] supervisor started (PID %d)\n' "${ts}" $$ >> "${watch_log}"
+    ok "supervisor started ${DIM}(PID $$, polling every ${WATCH_INTERVAL}s)${RST}"
+    watch_log "supervisor started (PID $$)"
 
     while true; do
         if [[ ! -f "${SERVICES_JSON}" ]]; then
@@ -539,139 +623,192 @@ cmd_watch() {
         names="$(enabled_names 2>/dev/null)" || true
 
         if [[ -n "${names}" ]]; then
-            while IFS= read -r svc; do
-                [[ -z "${svc}" ]] && continue
+            while IFS= read -r name; do
+                [[ -z "${name}" ]] && continue
 
-                # Skip crash-looped services
-                if is_crash_loop "${svc}"; then
+                if is_crash_loop "${name}"; then
                     continue
                 fi
 
-                if ! is_running "${svc}"; then
-                    ts="$(date '+%Y-%m-%d %H:%M:%S')"
-                    warn "[watch] ${svc} is down — restarting…"
-                    printf '[%s] auto-restart: %s\n' "${ts}" "${svc}" >> "${watch_log}"
+                if ! is_running "${name}"; then
+                    local had_pid=false
+                    [[ -f "$(pid_file "${name}")" ]] && had_pid=true
 
-                    record_restart "${svc}"
+                    local started_at
+                    started_at="$(get_started_at "${name}")"
+                    local was_started=false
+                    [[ -n "${started_at}" ]] && [[ "${started_at}" != "null" ]] && was_started=true
 
-                    if is_crash_loop "${svc}"; then
-                        printf '[%s] CRASH-LOOP: %s (>%d restarts in %ds)\n' \
-                            "${ts}" "${svc}" "${CRASH_LOOP_THRESHOLD}" "${CRASH_LOOP_WINDOW}" \
-                            >> "${watch_log}"
-                        local ll
-                        ll="$(last_log_line "${svc}")"
-                        [[ -n "${ll}" ]] && \
-                            printf '[%s]   last log: %s\n' "${ts}" "${ll}" >> "${watch_log}"
-                        warn "[watch] ${RED}${svc} entered CRASH-LOOP — giving up${RST}"
-                        continue
+                    if ${had_pid} || ${was_started}; then
+                        watch_log "detected ${name} is down — restarting"
+                        record_restart "${name}"
+
+                        if is_crash_loop "${name}"; then
+                            watch_log "CRASH-LOOP: ${name} (>${CRASH_LOOP_THRESHOLD} restarts in ${CRASH_LOOP_WINDOW}s)"
+                            local lf
+                            lf="$(log_file "${name}")"
+                            if [[ -f "${lf}" ]]; then
+                                watch_log "last log: $(tail -1 "${lf}" 2>/dev/null)"
+                            fi
+                            warn "${name} entered ${RED}CRASH-LOOP${RST} — giving up"
+                            continue
+                        fi
+
+                        do_start "${name}" 2>/dev/null || {
+                            watch_log "failed to restart ${name}"
+                        }
                     fi
-
-                    cmd_start "${svc}" 2>&1 | while IFS= read -r line; do
-                        printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${line}" >> "${watch_log}"
-                    done
                 fi
             done <<< "${names}"
+        fi
+
+        # Rotate logs periodically
+        local all_names
+        all_names="$(service_names 2>/dev/null)" || true
+        if [[ -n "${all_names}" ]]; then
+            while IFS= read -r name; do
+                [[ -z "${name}" ]] && continue
+                rotate_log "${name}"
+            done <<< "${all_names}"
         fi
 
         sleep "${WATCH_INTERVAL}"
     done
 }
 
-# ── help ─────────────────────────────────────────────────────────────────
-cmd_help() {
-    cat <<EOF
+# ── Usage ─────────────────────────────────────────────────────────────────────
+usage() {
+    cat <<USAGEEOF
 
-  ${BOLD}ada${RST} v${ADA_VERSION} — service manager for desktop-jobs
+  ${BOLD}ada${RST} v${ADA_VERSION} — service manager for desktop jobs
 
-  ${BOLD}USAGE${RST}
-    ada status                       Show all services
-    ada start  <name|all>            Start a service (skips if already running)
-    ada stop   <name|all>            Graceful stop (SIGTERM → SIGKILL after ${STOP_GRACE}s)
-    ada restart <name|all>           Restart (clears crash-loop flag)
-    ada logs   <name> [-n N] [-f]    Tail service log (-f is default)
-    ada add    <name> <cmd> <dir> [env_file]
-                                     Register a new service
-    ada remove <name>                Unregister (stops first if running)
-    ada enable  <name>               Enable a service
-    ada disable <name>               Disable a service
-    ada watch                        Start supervisor (auto-restarts crashed services)
+  ${BOLD}COMMANDS${RST}
+    ${GREEN}ada status${RST}                   Show status of all services
+    ${GREEN}ada start${RST} <name|all>          Start a service (or all enabled)
+    ${GREEN}ada stop${RST} <name|all>           Stop a service (or all)
+    ${GREEN}ada restart${RST} <name|all>        Restart a service (or all)
+    ${GREEN}ada logs${RST} <name> [-n N] [-f]   Tail logs (-f) or last N lines
+    ${GREEN}ada add${RST} <name> <cmd> <dir> [env_file]
+                                 Add a new service
+    ${GREEN}ada remove${RST} <name>             Remove a service (stops first)
+    ${GREEN}ada enable${RST} <name>             Enable a service
+    ${GREEN}ada disable${RST} <name>            Disable a service
+    ${GREEN}ada watch${RST}                     Start supervisor loop (foreground)
 
   ${BOLD}EXAMPLES${RST}
-    ada start all                    Start every enabled service
-    ada logs ace-step -n 100         Last 100 lines of ace-step log
-    nohup ada watch &                Run supervisor in background
+    ada start all                Start all enabled services
+    ada logs ace-step -n 100     Last 100 lines of ace-step log
+    nohup ada watch &            Run supervisor in background
+    ada add my-api "node app.js" ~/projects/my-api ~/env.vars
 
   ${BOLD}FILES${RST}
-    ${DIM}~/.ada/pids/<name>.pid${RST}         PID tracking
-    ${DIM}~/.ada/logs/<name>.log${RST}         Per-service logs (${MAX_LOG_BYTES} byte rotation)
-    ${DIM}~/.ada/logs/watch.log${RST}          Supervisor log
-    ${DIM}~/.ada/state/<name>.json${RST}       Restart counters & crash-loop state
+    ${DIM}~/.ada/logs/<name>.log${RST}       Per-service log output
+    ${DIM}~/.ada/pids/<name>.pid${RST}       PID tracking files
+    ${DIM}~/.ada/state/<name>.json${RST}     Restart counters & state
+    ${DIM}~/.ada/logs/supervisor.log${RST}   Supervisor activity log
 
-EOF
+USAGEEOF
 }
 
-# ═══════════════════════════════════════════════════════════════════════
-#  DISPATCH
-# ═══════════════════════════════════════════════════════════════════════
-main() {
-    local cmd="${1:-status}"
-    shift 2>/dev/null || true
-
-    case "${cmd}" in
-        status|st|s)
-            cmd_status
-            ;;
-        start)
-            [[ $# -lt 1 ]] && die "usage: ada start <name|all>"
-            while IFS= read -r t; do
-                cmd_start "${t}"
-            done <<< "$(resolve_enabled_targets "$1")"
-            ;;
-        stop)
-            [[ $# -lt 1 ]] && die "usage: ada stop <name|all>"
-            while IFS= read -r t; do
-                cmd_stop "${t}"
-            done <<< "$(resolve_targets "$1")"
-            ;;
-        restart)
-            [[ $# -lt 1 ]] && die "usage: ada restart <name|all>"
-            while IFS= read -r t; do
-                cmd_restart "${t}"
-            done <<< "$(resolve_enabled_targets "$1")"
-            ;;
-        logs|log|l)
-            [[ $# -lt 1 ]] && die "usage: ada logs <name> [-n N]"
-            cmd_logs "$@"
-            ;;
-        add)
-            [[ $# -lt 3 ]] && die "usage: ada add <name> <cmd> <dir> [env_file]"
-            cmd_add "$@"
-            ;;
-        remove|rm)
-            [[ $# -lt 1 ]] && die "usage: ada remove <name>"
-            cmd_remove "$1"
-            ;;
-        enable)
-            [[ $# -lt 1 ]] && die "usage: ada enable <name>"
-            cmd_enable "$1"
-            ;;
-        disable)
-            [[ $# -lt 1 ]] && die "usage: ada disable <name>"
-            cmd_disable "$1"
-            ;;
-        watch|w)
-            cmd_watch
-            ;;
-        help|--help|-h|h)
-            cmd_help
-            ;;
-        version|--version|-v)
-            printf 'ada %s\n' "${ADA_VERSION}"
-            ;;
-        *)
-            die "unknown command: ${cmd}  (try: ada help)"
-            ;;
-    esac
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+resolve_targets() {
+    local target="$1"
+    local cmd_context="${2:-start}"
+    if [[ "${target}" == "all" ]]; then
+        if [[ "${cmd_context}" == "start" ]]; then
+            enabled_names
+        else
+            service_names
+        fi
+    else
+        printf '%s\n' "${target}"
+    fi
 }
 
-main "$@"
+cmd="${1:-}"
+[[ -z "${cmd}" ]] && { usage; exit 0; }
+shift
+
+case "${cmd}" in
+    status|st|s)
+        do_status
+        ;;
+
+    start)
+        require_config
+        [[ $# -lt 1 ]] && die "usage: ada start <name|all>"
+        targets="$(resolve_targets "$1" "start")"
+        [[ -z "${targets}" ]] && die "no enabled services to start"
+        while IFS= read -r name; do
+            [[ -z "${name}" ]] && continue
+            do_start "${name}"
+        done <<< "${targets}"
+        ;;
+
+    stop)
+        require_config
+        [[ $# -lt 1 ]] && die "usage: ada stop <name|all>"
+        targets="$(resolve_targets "$1" "stop")"
+        while IFS= read -r name; do
+            [[ -z "${name}" ]] && continue
+            do_stop "${name}"
+        done <<< "${targets}"
+        ;;
+
+    restart)
+        require_config
+        [[ $# -lt 1 ]] && die "usage: ada restart <name|all>"
+        targets="$(resolve_targets "$1" "restart")"
+        while IFS= read -r name; do
+            [[ -z "${name}" ]] && continue
+            do_restart "${name}"
+        done <<< "${targets}"
+        ;;
+
+    logs|log|l)
+        require_config
+        [[ $# -lt 1 ]] && die "usage: ada logs <name> [-n N]"
+        do_logs "$@"
+        ;;
+
+    add)
+        require_config
+        [[ $# -lt 3 ]] && die "usage: ada add <name> <cmd> <dir> [env_file]"
+        do_add "$@"
+        ;;
+
+    remove|rm)
+        require_config
+        [[ $# -lt 1 ]] && die "usage: ada remove <name>"
+        do_remove "$1"
+        ;;
+
+    enable)
+        require_config
+        [[ $# -lt 1 ]] && die "usage: ada enable <name>"
+        do_enable "$1"
+        ;;
+
+    disable)
+        require_config
+        [[ $# -lt 1 ]] && die "usage: ada disable <name>"
+        do_disable "$1"
+        ;;
+
+    watch|w)
+        require_config
+        do_watch
+        ;;
+
+    version|--version|-v)
+        printf 'ada v%s\n' "${ADA_VERSION}"
+        ;;
+
+    help|--help|-h)
+        usage
+        ;;
+
+    *)
+        die "unknown command: ${cmd}  (try: ada help)"
+        ;;
+esac

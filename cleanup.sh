@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Kill any existing instances of managed services for a clean transition to ada.
+# Kill any existing instances of managed services for clean transition to ada.
 # Run once before starting ada for the first time.
 set -euo pipefail
 
@@ -14,16 +14,16 @@ pkill -f 'node.*projects/song-creator-ats' 2>/dev/null && echo "  killed song-cr
 # nanobazaar-seller
 pkill -f 'node.*projects/nanobazaar-song-seller' 2>/dev/null && echo "  killed nanobazaar-seller" || echo "  nanobazaar-seller not running"
 
-# Kill any ada watch supervisor
-if [[ -f "${HOME}/.ada/watch.lock" ]]; then
-    pid=$(cat "${HOME}/.ada/watch.lock" 2>/dev/null || true)
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null && echo "  killed ada supervisor (PID $pid)" || true
+# Stop any running ada supervisor
+if [[ -f ~/.ada/watch.lock ]]; then
+    wpid=$(cat ~/.ada/watch.lock 2>/dev/null)
+    if [[ -n "$wpid" ]] && kill -0 "$wpid" 2>/dev/null; then
+        kill "$wpid" 2>/dev/null && echo "  killed ada supervisor (PID $wpid)" || true
     fi
-    rm -f "${HOME}/.ada/watch.lock"
+    rm -f ~/.ada/watch.lock
 fi
 
-# Clean up stale ada state
-rm -rf ~/.ada/pids/*.pid 2>/dev/null || true
+# Clean stale pid files
+rm -f ~/.ada/pids/*.pid 2>/dev/null || true
 
-echo "Done. Ready for: ./ada start all"
+echo "Done. Ready for: ada start all"
