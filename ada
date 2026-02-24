@@ -694,6 +694,7 @@ usage() {
     ${GREEN}ada enable${RST} <name>             Enable a service
     ${GREEN}ada disable${RST} <name>            Disable a service
     ${GREEN}ada watch${RST}                     Start supervisor loop (foreground)
+    ${GREEN}ada dashboard${RST} [-p PORT]       Launch web dashboard (default: 7070)
 
   ${BOLD}EXAMPLES${RST}
     ada start all                Start all enabled services
@@ -798,6 +799,18 @@ case "${cmd}" in
     watch|w)
         require_config
         do_watch
+        ;;
+
+    dashboard|dash|d)
+        port=7070
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -p|--port) port="$2"; shift 2 ;;
+                *) die "unknown option: $1 (try: ada dashboard -p 8080)" ;;
+            esac
+        done
+        info "starting dashboard on ${BOLD}http://0.0.0.0:${port}${RST}"
+        exec python3 "${SCRIPT_DIR}/ada-dashboard.py" "${port}"
         ;;
 
     version|--version|-v)
